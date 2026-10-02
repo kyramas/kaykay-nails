@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   Plus, X, Trash2, Pencil, Phone, MessageCircle, ChevronRight,
   ChevronLeft, Search, ListChecks, CalendarDays, Sparkles, Users,
@@ -122,12 +122,24 @@ export default function App() {
   const [dayListDate, setDayListDate] = useState(null); // iso date string, shows all bookings for that day
   const [clientModal, setClientModal] = useState(null);
   const [serviceModal, setServiceModal] = useState(null);
-  const [calCursor, setCalCursor] = useState(() => new Date(2026, 8, 1));
+  const [calCursor, setCalCursor] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
   const [calView, setCalView] = useState("month");
   const [confirmState, setConfirmState] = useState(null); // { message, onConfirm }
   const [clientDetailId, setClientDetailId] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [syncError, setSyncError] = useState(null);
+  const scrollRef = useRef(null);
+
+  // Bookings are listed oldest-to-newest, so jump to the bottom whenever the
+  // Bookings tab opens — that's where the newest booking sits.
+  useEffect(() => {
+    if (tab === "bookings" && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [tab, appointments.length]);
 
   function askConfirm(message, onConfirm) {
     setConfirmState({ message, onConfirm });
@@ -180,7 +192,7 @@ export default function App() {
   const sortedAppointments = useMemo(
     () =>
       [...appointments].sort((a, b) =>
-        a.date === b.date ? b.time.localeCompare(a.time) : b.date.localeCompare(a.date)
+        a.date === b.date ? a.time.localeCompare(b.time) : a.date.localeCompare(b.date)
       ),
     [appointments]
   );
@@ -333,7 +345,7 @@ export default function App() {
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto px-4 pb-32 pt-3" style={{ background: BG }}>
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 pb-32 pt-3" style={{ background: BG }}>
         {tab === "bookings" && (
           <BookingsView
             appts={filteredAppointments}
@@ -1298,7 +1310,7 @@ function AppointmentModal({ appt, clients, services, appointments, onSave, onClo
   const [addingClient, setAddingClient] = useState(false);
   const [clientError, setClientError] = useState("");
   const [serviceIds, setServiceIds] = useState(appt.serviceIds || []);
-  const [date, setDate] = useState(appt.date || isoDate(new Date(2026, 8, 14)));
+  const [date, setDate] = useState(appt.date || isoDate(new Date()));
   const [time, setTime] = useState(appt.time || "10:00");
   const [notes, setNotes] = useState(appt.notes || "");
 
