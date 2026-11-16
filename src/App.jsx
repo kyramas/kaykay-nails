@@ -16,7 +16,7 @@ const TEXT_DIM = "#AD949B";
 const ACCENT = "#C9738C";
 const NAV_INACTIVE = "#E4D3D8";
 
-const CATEGORY_COLORS = {
+const SERVICE_CATEGORY_COLORS = {
   Extensions: "#E2562E",
   "Fill/Overlay": "#4C9A6B",
   Manicure: "#4A7FB5",
@@ -24,7 +24,16 @@ const CATEGORY_COLORS = {
   "Add-ons": "#D6883F",
   "Removal/Repair": "#B7A23B",
 };
-const CATEGORY_ORDER = Object.keys(CATEGORY_COLORS);
+// Only real service categories belong in the Services tab / category dropdown.
+const CATEGORY_ORDER = Object.keys(SERVICE_CATEGORY_COLORS);
+// "Note" is a calendar-only entry type (no client, no services), so it gets its
+// own neutral slate color and is NOT part of CATEGORY_ORDER.
+const NOTE_COLOR = "#8A96A8";
+const CATEGORY_COLORS = { ...SERVICE_CATEGORY_COLORS, Note: NOTE_COLOR };
+
+// A note is a calendar entry with no client and no services. Its optional
+// description lives in the existing `notes` field, so no database change is needed.
+const isNote = (appt) => !appt.clientId && (appt.serviceIds || []).length === 0;
 
 const SERIF = "'Iowan Old Style', 'Palatino Linotype', Georgia, serif";
 const SANS =
@@ -176,6 +185,7 @@ export default function App() {
 
   const categoryOf = useCallback(
     (appt) => {
+      if (isNote(appt)) return "Note";
       const first = serviceById(appt.serviceIds?.[0]);
       return first?.category || "Removal/Repair";
     },
@@ -201,6 +211,9 @@ export default function App() {
     if (!search.trim()) return sortedAppointments;
     const q = search.toLowerCase();
     return sortedAppointments.filter((a) => {
+      if (isNote(a)) {
+        return "note".includes(q) || (a.notes || "").toLowerCase().includes(q);
+      }
       const client = clientById(a.clientId);
       return (
         client?.name?.toLowerCase().includes(q) ||
@@ -260,7 +273,8 @@ export default function App() {
   }
   function confirmDeleteAppointment(appt) {
     const client = clientById(appt.clientId);
-    askConfirm(`Delete ${client?.name || "this"}'s booking on ${prettyDate(appt.date)}? This can't be undone.`, () =>
+    const what = isNote(appt) ? "the note" : `${client?.name || "this"}'s booking`;
+    askConfirm(`Delete ${what} on ${prettyDate(appt.date)}? This can't be undone.`, () =>
       deleteAppointment(appt.id)
     );
   }
@@ -637,30 +651,35 @@ function BookingsView({ appts, clientById, categoryOf, apptServiceNames, earning
           {appts.map((a) => {
             const client = clientById(a.clientId);
             const cat = categoryOf(a);
+            const note = isNote(a);
             return (
               <div key={a.id} style={{ background: SURFACE, borderColor: BORDER }} className="rounded-2xl border p-3">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="font-semibold text-[15px] truncate">{client?.name || "Unknown"}</span>
+                      <span className="font-semibold text-[15px] truncate">{note ? "Note" : client?.name || "Unknown"}</span>
                     </div>
                     <div style={{ color: TEXT_DIM }} className="text-xs mt-0.5">
                       {prettyDate(a.date)} · {prettyTime(a.time)}
                     </div>
                     <div className="flex items-center gap-1.5 mt-1.5">
                       <CategoryDot category={cat} />
-                      <span style={{ color: CATEGORY_COLORS[cat] }} className="text-xs font-medium truncate">
-                        {apptServiceNames(a)}
+                      <span style={{ color: note ? TEXT_DIM : CATEGORY_COLORS[cat] }} className="text-xs font-medium truncate">
+                        {note ? a.notes || "No description" : apptServiceNames(a)}
                       </span>
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
-                    <IconBtn href={client?.phone ? `tel:${client.phone}` : undefined}>
-                      <Phone size={14} color={TEXT_DIM} />
-                    </IconBtn>
-                    <IconBtn href={client?.phone ? `sms:${client.phone}` : undefined}>
-                      <MessageCircle size={14} color={TEXT_DIM} />
-                    </IconBtn>
+                    {!note && (
+                      <>
+                        <IconBtn href={client?.phone ? `tel:${client.phone}` : undefined}>
+                          <Phone size={14} color={TEXT_DIM} />
+                        </IconBtn>
+                        <IconBtn href={client?.phone ? `sms:${client.phone}` : undefined}>
+                          <MessageCircle size={14} color={TEXT_DIM} />
+                        </IconBtn>
+                      </>
+                    )}
                     <IconBtn onClick={() => onEdit(a)}>
                       <Pencil size={14} color={TEXT_DIM} />
                     </IconBtn>
@@ -718,7 +737,7 @@ function ViewToggle({ view, setView }) {
 function CategoryLegend() {
   return (
     <div className="flex flex-wrap gap-x-3 gap-y-1.5 mt-5">
-      {CATEGORY_ORDER.map((cat) => (
+      {[...CATEGORY_ORDER, "Note"].map((cat) => (
         <div key={cat} className="flex items-center gap-1.5">
           <CategoryDot category={cat} size={8} />
           <span style={{ color: TEXT_DIM }} className="text-[10px]">{cat}</span>
@@ -730,6 +749,7 @@ function CategoryLegend() {
 
 function AgendaRow({ appt, client, category, serviceNames, onSelect }) {
   const color = CATEGORY_COLORS[category] || "#888";
+  const note = isNote(appt);
   return (
     <button
       onClick={() => onSelect(appt)}
@@ -739,10 +759,14 @@ function AgendaRow({ appt, client, category, serviceNames, onSelect }) {
       <div style={{ background: color }} className="w-1.5 shrink-0" />
       <div className="py-2.5 pr-3 min-w-0 flex-1">
         <div className="flex items-center justify-between gap-2">
-          <span className="text-sm font-semibold truncate">{client?.name || "—"}</span>
+          <span className="text-sm font-semibold truncate">{note ? "Note" : client?.name || "—"}</span>
           <span style={{ color: TEXT_DIM }} className="text-xs shrink-0">{prettyTime(appt.time)}</span>
         </div>
-        <span style={{ color }} className="text-xs font-medium truncate block mt-0.5">{serviceNames}</span>
+        {(!note || appt.notes) && (
+          <span style={{ color: note ? TEXT_DIM : color }} className="text-xs font-medium truncate block mt-0.5">
+            {note ? appt.notes : serviceNames}
+          </span>
+        )}
       </div>
     </button>
   );
@@ -872,7 +896,7 @@ function MonthGrid({ cursor, apptsByDay, clientById, categoryOf, onSelect, onDay
                     className="w-full text-left rounded-[4px] px-1 py-[1px] active:scale-95 transition-transform"
                   >
                     <span style={{ color: "#1A1215" }} className="text-[9px] font-semibold leading-tight block truncate">
-                      {client?.name || "—"}
+                      {isNote(a) ? "Note" : client?.name || "—"}
                     </span>
                   </button>
                 );
@@ -961,6 +985,7 @@ function DetailRow({ label, value }) {
 }
 
 function BookingDetailModal({ appt, client, category, serviceNames, total, duration, onClose, onEdit, onDelete }) {
+  const note = isNote(appt);
   return (
     <div className="fixed inset-0 z-20 flex items-end" style={{ background: "rgba(0,0,0,0.55)" }}>
       <div
@@ -970,24 +995,38 @@ function BookingDetailModal({ appt, client, category, serviceNames, total, durat
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2">
             <CategoryDot category={category} size={10} />
-            <h2 style={{ fontFamily: SERIF }} className="text-lg">{client?.name || "Booking"}</h2>
+            <h2 style={{ fontFamily: SERIF }} className="text-lg">{note ? "Note" : client?.name || "Booking"}</h2>
           </div>
           <div className="flex items-center gap-1.5">
-            <IconBtn href={client?.phone ? `tel:${client.phone}` : undefined}><Phone size={14} color={TEXT_DIM} /></IconBtn>
-            <IconBtn href={client?.phone ? `sms:${client.phone}` : undefined}><MessageCircle size={14} color={TEXT_DIM} /></IconBtn>
+            {!note && (
+              <>
+                <IconBtn href={client?.phone ? `tel:${client.phone}` : undefined}><Phone size={14} color={TEXT_DIM} /></IconBtn>
+                <IconBtn href={client?.phone ? `sms:${client.phone}` : undefined}><MessageCircle size={14} color={TEXT_DIM} /></IconBtn>
+              </>
+            )}
             <IconBtn onClick={onClose}><X size={15} color={TEXT_DIM} /></IconBtn>
           </div>
         </div>
 
         <div className="mt-3">
-          <DetailRow label="Client" value={client?.name || "—"} />
-          <DetailRow label="Phone number" value={client?.phone || "—"} />
-          <DetailRow label="Service" value={<span style={{ color: CATEGORY_COLORS[category] }}>{serviceNames}</span>} />
-          <DetailRow label="Date" value={prettyDate(appt.date)} />
-          <DetailRow label="Start time" value={prettyTime(appt.time)} />
-          <DetailRow label="Duration" value={`${duration} min`} />
-          <DetailRow label="Total price" value={money(total)} />
-          {appt.notes && <DetailRow label="Notes" value={appt.notes} />}
+          {note ? (
+            <>
+              <DetailRow label="Date" value={prettyDate(appt.date)} />
+              <DetailRow label="Time" value={prettyTime(appt.time)} />
+              <DetailRow label="Description" value={appt.notes || "—"} />
+            </>
+          ) : (
+            <>
+              <DetailRow label="Client" value={client?.name || "—"} />
+              <DetailRow label="Phone number" value={client?.phone || "—"} />
+              <DetailRow label="Service" value={<span style={{ color: CATEGORY_COLORS[category] }}>{serviceNames}</span>} />
+              <DetailRow label="Date" value={prettyDate(appt.date)} />
+              <DetailRow label="Start time" value={prettyTime(appt.time)} />
+              <DetailRow label="Duration" value={`${duration} min`} />
+              <DetailRow label="Total price" value={money(total)} />
+              {appt.notes && <DetailRow label="Notes" value={appt.notes} />}
+            </>
+          )}
         </div>
 
         <div className="flex gap-3 mt-5">
@@ -1304,6 +1343,10 @@ const inputCls = "w-full text-sm rounded-xl border px-3 py-2.5 outline-none";
 /* ---------- appointment modal ---------- */
 function AppointmentModal({ appt, clients, services, appointments, onSave, onClose, onAddClient }) {
   const isNew = !appt.id;
+  // "booking" = normal client appointment, "note" = a plain calendar note.
+  // Editing an existing entry keeps its type; the switch only shows for new ones.
+  const [mode, setMode] = useState(appt.id && isNote(appt) ? "note" : "booking");
+  const noteMode = mode === "note";
   const [clientId, setClientId] = useState(appt.clientId || "");
   const [newClientName, setNewClientName] = useState("");
   const [newClientPhone, setNewClientPhone] = useState("");
@@ -1322,17 +1365,18 @@ function AppointmentModal({ appt, clients, services, appointments, onSave, onClo
   const totalDuration = serviceIds.reduce((sum, id) => sum + (services.find((s) => s.id === id)?.duration || 0), 0);
 
   const conflict = useMemo(() => {
-    if (!date || !time || totalDuration === 0) return null;
+    if (noteMode || !date || !time || totalDuration === 0) return null;
     const start = timeToMin(time);
     const end = start + totalDuration;
     return (appointments || []).find((a) => {
       if (a.id === appt.id) return false; // ignore self when editing
+      if (isNote(a)) return false; // notes never count as a scheduling conflict
       if (a.date !== date) return false;
       const aStart = timeToMin(a.time);
       const aDur = (a.serviceIds || []).reduce((sum, id) => sum + (services.find((s) => s.id === id)?.duration || 0), 0);
       return rangesOverlap(start, end, aStart, aStart + aDur);
     });
-  }, [date, time, totalDuration, appointments, appt.id, services]);
+  }, [noteMode, date, time, totalDuration, appointments, appt.id, services]);
 
   function isDuplicateName(name) {
     const n = name.trim().toLowerCase();
@@ -1340,6 +1384,11 @@ function AppointmentModal({ appt, clients, services, appointments, onSave, onClo
   }
 
   function handleSave() {
+    if (noteMode) {
+      if (!date || !time) return;
+      onSave({ id: appt.id || uid(), clientId: null, serviceIds: [], date, time, notes: notes.trim() });
+      return;
+    }
     let finalClientId = clientId;
     if (addingClient) {
       const trimmed = newClientName.trim();
@@ -1357,7 +1406,31 @@ function AppointmentModal({ appt, clients, services, appointments, onSave, onClo
   }
 
   return (
-    <ModalShell title={isNew ? "New booking" : "Edit booking"} onClose={onClose} onSubmit={handleSave} submitLabel={isNew ? "Add booking" : "Save changes"}>
+    <ModalShell
+      title={noteMode ? (isNew ? "New note" : "Edit note") : isNew ? "New booking" : "Edit booking"}
+      onClose={onClose}
+      onSubmit={handleSave}
+      submitLabel={isNew ? (noteMode ? "Add note" : "Add booking") : "Save changes"}
+    >
+      {isNew && (
+        <div style={{ background: SURFACE_2 }} className="flex rounded-full p-1 mb-4">
+          {[["booking", "Booking"], ["note", "Note"]].map(([id, label]) => {
+            const active = mode === id;
+            return (
+              <button
+                key={id}
+                onClick={() => setMode(id)}
+                style={{ background: active ? ACCENT : "transparent", color: active ? "#1A1215" : TEXT_DIM }}
+                className="flex-1 rounded-full py-1.5 text-xs font-semibold transition-colors"
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {!noteMode && (<>
       <Field label="Client">
         {!addingClient ? (
           <>
@@ -1423,12 +1496,13 @@ function AppointmentModal({ appt, clients, services, appointments, onSave, onClo
           </div>
         )}
       </Field>
+      </>)}
 
       <div className="grid grid-cols-2 gap-3">
         <Field label="Date">
           <input type="date" style={inputStyle} className={inputCls} value={date} onChange={(e) => setDate(e.target.value)} />
         </Field>
-        <Field label="Start time">
+        <Field label={noteMode ? "Time" : "Start time"}>
           <input type="time" style={inputStyle} className={inputCls} value={time} onChange={(e) => setTime(e.target.value)} />
         </Field>
       </div>
@@ -1442,8 +1516,15 @@ function AppointmentModal({ appt, clients, services, appointments, onSave, onClo
         </div>
       )}
 
-      <Field label="Notes (optional)">
-        <textarea style={inputStyle} className={inputCls} rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} />
+      <Field label={noteMode ? "Description (optional)" : "Notes (optional)"}>
+        <textarea
+          style={inputStyle}
+          className={inputCls}
+          rows={noteMode ? 3 : 2}
+          placeholder={noteMode ? "e.g. Dentist at 3pm, day off, supplier visit…" : ""}
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+        />
       </Field>
     </ModalShell>
   );
