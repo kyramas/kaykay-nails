@@ -18,6 +18,7 @@ create table if not exists appointments (
   id text primary key,
   client_id text references clients(id) on delete set null,
   service_ids jsonb not null default '[]',
+  items jsonb not null default '[]'::jsonb,
   date text not null,
   time text not null,
   notes text default ''

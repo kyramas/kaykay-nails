@@ -6,3 +6,16 @@ html, body, #root {
   background: #000000;
   height: 100%;
 }
+
+/* Feels like an app: no rubber-band bounce, no grey tap flash. */
+html, body {
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* iPhones zoom into any field smaller than 16px; keep fields at 16px on phones. */
+@media (max-width: 640px) {
+  input, select, textarea {
+    font-size: 16px !important;
+  }
+}

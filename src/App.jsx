@@ -1,8 +1,8 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef, Fragment } from "react";
 import {
   Plus, X, Trash2, Pencil, Phone, MessageCircle, ChevronRight,
   ChevronLeft, Search, ListChecks, CalendarDays, Sparkles, Users,
-  RefreshCw, Check, Download, AlertTriangle,
+  RefreshCw, Check, Download, Upload, AlertTriangle,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
@@ -44,18 +44,25 @@ const SANS =
    supabase-setup.sql) rather than being hardcoded here. These helpers
    translate between this app's camelCase shape and Postgres's
    snake_case columns, and report errors instead of failing silently. */
+// Each booking keeps a snapshot of its services (name, price, duration, category)
+// in an `items` column, so changing a service's price later never rewrites
+// history. If the database hasn't been updated yet (supabase-migration-v2.sql),
+// SUPPORTS_ITEMS stays false and the app falls back to live service prices.
+let SUPPORTS_ITEMS = false;
+
 function apptFromRow(row) {
   return {
     id: row.id,
     clientId: row.client_id,
     serviceIds: row.service_ids || [],
+    items: Array.isArray(row.items) ? row.items : [],
     date: row.date,
     time: row.time,
     notes: row.notes || "",
   };
 }
 function apptToRow(appt) {
-  return {
+  const row = {
     id: appt.id,
     client_id: appt.clientId,
     service_ids: appt.serviceIds,
@@ -63,22 +70,112 @@ function apptToRow(appt) {
     time: appt.time,
     notes: appt.notes || "",
   };
+  if (SUPPORTS_ITEMS) row.items = appt.items || [];
+  return row;
+}
+
+const snapshotItem = (s) => ({
+  id: s.id,
+  name: s.name,
+  price: Number(s.price) || 0,
+  duration: Number(s.duration) || 0,
+  category: s.category,
+});
+
+// The services a booking was made with: its saved snapshot if it has one,
+// otherwise (older bookings, or database not updated yet) the live service list.
+function itemsOf(appt, serviceById) {
+  if (appt.items && appt.items.length) return appt.items;
+  return (appt.serviceIds || []).map((id) => serviceById(id)).filter(Boolean).map(snapshotItem);
+}
+
+// Supabase returns at most 1000 rows per request, so read in pages.
+async function fetchAllRows(table) {
+  const PAGE = 1000;
+  const rows = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from(table)
+      .select("*")
+      .order("id")
+      .range(from, from + PAGE - 1);
+    if (error) throw error;
+    rows.push(...(data || []));
+    if (!data || data.length < PAGE) break;
+  }
+  return rows;
 }
 
 async function fetchAllData() {
-  const [clientsRes, servicesRes, apptsRes] = await Promise.all([
-    supabase.from("clients").select("*"),
-    supabase.from("services").select("*"),
-    supabase.from("appointments").select("*"),
+  if (!SUPPORTS_ITEMS) {
+    const probe = await supabase.from("appointments").select("items").limit(1);
+    SUPPORTS_ITEMS = !probe.error;
+  }
+  const [clients, services, appts] = await Promise.all([
+    fetchAllRows("clients"),
+    fetchAllRows("services"),
+    fetchAllRows("appointments"),
   ]);
-  if (clientsRes.error) throw clientsRes.error;
-  if (servicesRes.error) throw servicesRes.error;
-  if (apptsRes.error) throw apptsRes.error;
   return {
-    clients: clientsRes.data || [],
-    services: servicesRes.data || [],
-    appointments: (apptsRes.data || []).map(apptFromRow),
+    clients,
+    services,
+    appointments: appts.map(apptFromRow),
+    itemsSupported: SUPPORTS_ITEMS,
   };
+}
+
+/* ---------- backup helpers ---------- */
+const BACKUP_KEY = "kaykay-last-backup";
+const SNOOZE_KEY = "kaykay-backup-snooze";
+const BACKUP_REMINDER_DAYS = 14;
+function lsGet(key) {
+  try { return window.localStorage.getItem(key); } catch { return null; }
+}
+function lsSet(key, value) {
+  try { window.localStorage.setItem(key, value); } catch { /* storage blocked: fine */ }
+}
+function daysSince(iso) {
+  if (!iso) return 0;
+  const [y, m, d] = iso.split("-").map(Number);
+  const then = new Date(y, m - 1, d);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.max(0, Math.round((today - then) / 86400000));
+}
+
+// Check a backup file and turn it into clean rows ready to upload.
+function parseBackup(data, currentClients, currentServices) {
+  if (!data || typeof data !== "object" || !Array.isArray(data.clients) ||
+      !Array.isArray(data.services) || !Array.isArray(data.appointments)) {
+    throw new Error("this isn't a Kay Kay Nails backup file");
+  }
+  const dedupe = (list) => {
+    const byId = new Map();
+    list.forEach((x) => { if (x && x.id != null) byId.set(String(x.id), x); });
+    return [...byId.values()];
+  };
+  const clients = dedupe(data.clients)
+    .filter((c) => typeof c.name === "string" && c.name.trim())
+    .map((c) => ({ id: String(c.id), name: c.name, phone: c.phone || "" }));
+  const services = dedupe(data.services)
+    .filter((s) => typeof s.name === "string" && s.category)
+    .map((s) => ({
+      id: String(s.id), name: s.name,
+      duration: Number(s.duration) || 0, price: Number(s.price) || 0, category: s.category,
+    }));
+  const knownClients = new Set([...currentClients, ...clients].map((c) => c.id));
+  const serviceLookup = new Map([...currentServices, ...services].map((s) => [s.id, s]));
+  const appointments = dedupe(data.appointments)
+    .filter((a) => typeof a.date === "string" && typeof a.time === "string")
+    .map((a) => {
+      const serviceIds = Array.isArray(a.serviceIds) ? a.serviceIds.map(String) : [];
+      const items = Array.isArray(a.items) && a.items.length
+        ? a.items
+        : serviceIds.map((id) => serviceLookup.get(id)).filter(Boolean).map(snapshotItem);
+      const clientId = a.clientId != null && knownClients.has(String(a.clientId)) ? String(a.clientId) : null;
+      return { id: String(a.id), clientId, serviceIds, items, date: a.date, time: a.time, notes: a.notes || "" };
+    });
+  return { clients, services, appointments };
 }
 
 /* ---------- generic helpers ---------- */
@@ -120,7 +217,7 @@ function downloadJSON(filename, data) {
 /* ============================================================ */
 export default function App() {
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState("bookings");
+  const [tab, setTab] = useState("calendar");
   const [clients, setClients] = useState([]);
   const [services, setServices] = useState([]);
   const [appointments, setAppointments] = useState([]);
@@ -140,34 +237,95 @@ export default function App() {
   const [clientDetailId, setClientDetailId] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [syncError, setSyncError] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [legacyMode, setLegacyMode] = useState(false); // true until supabase-migration-v2.sql has been run
+  const [lastBackup, setLastBackup] = useState(() => {
+    const saved = lsGet(BACKUP_KEY);
+    if (saved) return saved;
+    const today = isoDate(new Date());
+    lsSet(BACKUP_KEY, today); // first run on this device: start the 14-day clock now
+    return today;
+  });
+  const [snoozeUntil, setSnoozeUntil] = useState(() => lsGet(SNOOZE_KEY));
   const scrollRef = useRef(null);
+  const pendingWrites = useRef(0); // saves currently in flight
+  const writeVersion = useRef(0); // bumps whenever a save starts or ends
+  const lastFetch = useRef(0);
 
-  // Bookings are listed oldest-to-newest, so jump to the bottom whenever the
-  // Bookings tab opens — that's where the newest booking sits.
+  // Opening Bookings jumps to today (or the next upcoming booking).
   useEffect(() => {
-    if (tab === "bookings" && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    if (tab !== "bookings") return;
+    const box = scrollRef.current;
+    if (!box) return;
+    const target = box.querySelector("#next-booking");
+    if (target) {
+      box.scrollTop += target.getBoundingClientRect().top - box.getBoundingClientRect().top - 12;
+    } else {
+      box.scrollTop = 0;
     }
-  }, [tab, appointments.length]);
+  }, [tab]);
 
-  function askConfirm(message, onConfirm) {
-    setConfirmState({ message, onConfirm });
+  useEffect(() => {
+    if (!notice) return undefined;
+    const t = setTimeout(() => setNotice(null), 8000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
+  function askConfirm(message, onConfirm, confirmLabel = "Delete") {
+    setConfirmState({ message, onConfirm, confirmLabel });
   }
 
-  // Any background save that fails shows a small dismissible banner rather
-  // than failing silently — with a real database, network hiccups happen.
-  function reportSyncError(action, error) {
+  // Any save that fails shows a small dismissible banner rather than failing
+  // silently. By default the screen change is also undone, so what she sees
+  // always matches what's really saved.
+  function reportSyncError(action, error, undone = true) {
     console.error(action, error);
-    setSyncError(`Couldn't ${action} — check your connection. (${error.message || "unknown error"})`);
+    const why = error?.message || "unknown error";
+    setSyncError(
+      undone
+        ? `Couldn't ${action}, so the change was undone. Check your connection and try again. (${why})`
+        : `Couldn't ${action}. (${why})`
+    );
   }
+
+  // Runs one save. While it runs, auto-refresh stays out of the way. If it
+  // fails, `rollback` puts the screen back the way it was.
+  async function runWrite(label, request, rollback) {
+    pendingWrites.current += 1;
+    writeVersion.current += 1;
+    try {
+      const { error } = await request();
+      if (error) throw error;
+      return true;
+    } catch (error) {
+      if (rollback) rollback();
+      reportSyncError(label, error);
+      return false;
+    } finally {
+      pendingWrites.current -= 1;
+      writeVersion.current += 1;
+    }
+  }
+
+  // Reads everything from the database. Throws if it can't. Returns false (and
+  // changes nothing) if a save happened while it was reading, so a refresh can
+  // never overwrite a change that was just made.
+  const loadAll = useCallback(async () => {
+    const versionAtStart = writeVersion.current;
+    const data = await fetchAllData();
+    if (pendingWrites.current > 0 || writeVersion.current !== versionAtStart) return false;
+    setClients(data.clients);
+    setServices(data.services);
+    setAppointments(data.appointments);
+    setLegacyMode(!data.itemsSupported);
+    lastFetch.current = Date.now();
+    return true;
+  }, []);
 
   useEffect(() => {
     (async () => {
       try {
-        const { clients, services, appointments } = await fetchAllData();
-        setClients(clients);
-        setServices(services);
-        setAppointments(appointments);
+        await loadAll();
       } catch (err) {
         console.error("Failed to load data", err);
         setLoadError(
@@ -178,26 +336,46 @@ export default function App() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [loadAll]);
+
+  // Auto-refresh: when the app is reopened or comes back online, and once a
+  // minute while it's open, so two devices stay in step. Fails silently.
+  useEffect(() => {
+    const refreshIfDue = (minGapMs) => {
+      if (document.visibilityState !== "visible") return;
+      if (pendingWrites.current > 0) return;
+      if (Date.now() - lastFetch.current < minGapMs) return;
+      loadAll().catch((err) => console.warn("Background refresh failed", err));
+    };
+    const onWake = () => refreshIfDue(10000);
+    document.addEventListener("visibilitychange", onWake);
+    window.addEventListener("focus", onWake);
+    window.addEventListener("online", onWake);
+    const timer = setInterval(() => refreshIfDue(55000), 60000);
+    return () => {
+      document.removeEventListener("visibilitychange", onWake);
+      window.removeEventListener("focus", onWake);
+      window.removeEventListener("online", onWake);
+      clearInterval(timer);
+    };
+  }, [loadAll]);
 
   const clientById = useCallback((id) => clients.find((c) => c.id === id), [clients]);
   const serviceById = useCallback((id) => services.find((s) => s.id === id), [services]);
 
+  const itemsFor = (appt) => itemsOf(appt, serviceById);
+
   const categoryOf = useCallback(
     (appt) => {
       if (isNote(appt)) return "Note";
-      const first = serviceById(appt.serviceIds?.[0]);
-      return first?.category || "Removal/Repair";
+      return itemsOf(appt, serviceById)[0]?.category || "Removal/Repair";
     },
     [serviceById]
   );
 
-  const apptTotal = (appt) =>
-    (appt.serviceIds || []).reduce((sum, id) => sum + (serviceById(id)?.price || 0), 0);
-  const apptDuration = (appt) =>
-    (appt.serviceIds || []).reduce((sum, id) => sum + (serviceById(id)?.duration || 0), 0);
-  const apptServiceNames = (appt) =>
-    (appt.serviceIds || []).map((id) => serviceById(id)?.name).filter(Boolean).join(", ");
+  const apptTotal = (appt) => itemsFor(appt).reduce((sum, i) => sum + (Number(i.price) || 0), 0);
+  const apptDuration = (appt) => itemsFor(appt).reduce((sum, i) => sum + (Number(i.duration) || 0), 0);
+  const apptServiceNames = (appt) => itemsFor(appt).map((i) => i.name).filter(Boolean).join(", ");
 
   const sortedAppointments = useMemo(
     () =>
@@ -220,18 +398,19 @@ export default function App() {
         apptServiceNames(a).toLowerCase().includes(q)
       );
     });
-  }, [sortedAppointments, search, clientById]);
+  }, [sortedAppointments, search, clientById, services]);
 
   const earnings = useMemo(() => {
     const now = new Date();
     const todayIso = isoDate(now);
     const weekStart = isoDate(startOfWeek(now));
+    const weekEnd = isoDate(addDays(startOfWeek(now), 6));
     const monthPrefix = `${now.getFullYear()}-${pad(now.getMonth() + 1)}`;
     let today = 0, week = 0, month = 0;
     appointments.forEach((a) => {
       const total = apptTotal(a);
       if (a.date === todayIso) today += total;
-      if (a.date >= weekStart) week += total;
+      if (a.date >= weekStart && a.date <= weekEnd) week += total;
       if (a.date.startsWith(monthPrefix)) month += total;
     });
     return { today, week, month };
@@ -240,12 +419,12 @@ export default function App() {
   const serviceStats = useMemo(() => {
     const stats = {};
     appointments.forEach((a) => {
-      (a.serviceIds || []).forEach((id) => {
-        const s = serviceById(id);
-        if (!s) return;
-        if (!stats[id]) stats[id] = { service: s, count: 0, revenue: 0 };
-        stats[id].count += 1;
-        stats[id].revenue += s.price;
+      if (isNote(a)) return;
+      itemsFor(a).forEach((item) => {
+        const key = item.id;
+        if (!stats[key]) stats[key] = { service: serviceById(key) || item, count: 0, revenue: 0 };
+        stats[key].count += 1;
+        stats[key].revenue += Number(item.price) || 0;
       });
     });
     return Object.values(stats).sort((a, b) => b.count - a.count);
@@ -253,70 +432,155 @@ export default function App() {
 
   function exportBackup() {
     downloadJSON(`kaykay-nails-backup-${isoDate(new Date())}.json`, { clients, services, appointments });
+    const today = isoDate(new Date());
+    lsSet(BACKUP_KEY, today);
+    setLastBackup(today);
   }
 
-  function upsertAppointment(appt) {
-    setAppointments((prev) => {
-      const exists = prev.some((a) => a.id === appt.id);
-      return exists ? prev.map((a) => (a.id === appt.id ? appt : a)) : [...prev, appt];
-    });
-    setApptModal(null);
-    supabase.from("appointments").upsert(apptToRow(appt)).then(({ error }) => {
-      if (error) reportSyncError("save that booking", error);
-    });
+  async function handleRestoreFile(file) {
+    try {
+      const data = JSON.parse(await file.text());
+      const parsed = parseBackup(data, clients, services);
+      askConfirm(
+        `Restore this backup? It has ${parsed.clients.length} clients, ${parsed.services.length} services ` +
+        `and ${parsed.appointments.length} bookings. Items with the same ID are replaced by the backup's version; ` +
+        `nothing is deleted. Only use a backup exported from this app.`,
+        () => restoreBackup(parsed),
+        "Restore"
+      );
+    } catch (err) {
+      setSyncError(`That file couldn't be used as a backup: ${err.message || "unreadable file"}.`);
+    }
   }
-  function deleteAppointment(id) {
-    setAppointments((prev) => prev.filter((a) => a.id !== id));
-    supabase.from("appointments").delete().eq("id", id).then(({ error }) => {
-      if (error) reportSyncError("delete that booking", error);
-    });
+  async function restoreBackup(parsed) {
+    pendingWrites.current += 1;
+    writeVersion.current += 1;
+    let ok = true;
+    try {
+      const batches = [
+        ["clients", parsed.clients],
+        ["services", parsed.services],
+        ["appointments", parsed.appointments.map(apptToRow)],
+      ];
+      for (const [table, rows] of batches) {
+        for (let i = 0; i < rows.length; i += 200) {
+          const { error } = await supabase.from(table).upsert(rows.slice(i, i + 200));
+          if (error) throw error;
+        }
+      }
+    } catch (err) {
+      ok = false;
+      reportSyncError("finish restoring the backup (some of it may have been restored; running it again is safe)", err, false);
+    } finally {
+      pendingWrites.current -= 1;
+      writeVersion.current += 1;
+    }
+    try { await loadAll(); } catch (err) { console.warn("Reload after restore failed", err); }
+    if (ok) {
+      setNotice(
+        `Backup restored: ${parsed.clients.length} clients, ${parsed.services.length} services, ${parsed.appointments.length} bookings.`
+      );
+    }
+  }
+
+  // `newClient` is only set when a booking is saved together with a brand-new
+  // client. The client is saved first, so the booking can never point at a
+  // client that doesn't exist yet.
+  async function upsertAppointment(appt, newClient) {
+    const prevAppt = appointments.find((a) => a.id === appt.id) || null;
+    setAppointments((prev) =>
+      prev.some((a) => a.id === appt.id) ? prev.map((a) => (a.id === appt.id ? appt : a)) : [...prev, appt]
+    );
+    if (newClient) setClients((prev) => [...prev, newClient]);
+    setApptModal(null);
+    const undoAppt = () =>
+      setAppointments((prev) =>
+        prevAppt ? prev.map((a) => (a.id === appt.id ? prevAppt : a)) : prev.filter((a) => a.id !== appt.id)
+      );
+    if (newClient) {
+      const clientSaved = await runWrite(
+        "save that new client",
+        () => supabase.from("clients").insert(newClient),
+        () => setClients((prev) => prev.filter((c) => c.id !== newClient.id))
+      );
+      if (!clientSaved) {
+        undoAppt();
+        return;
+      }
+    }
+    await runWrite("save that booking", () => supabase.from("appointments").upsert(apptToRow(appt)), undoAppt);
+  }
+  function deleteAppointment(appt) {
+    setAppointments((prev) => prev.filter((a) => a.id !== appt.id));
+    runWrite(
+      "delete that booking",
+      () => supabase.from("appointments").delete().eq("id", appt.id),
+      () => setAppointments((prev) => (prev.some((a) => a.id === appt.id) ? prev : [...prev, appt]))
+    );
   }
   function confirmDeleteAppointment(appt) {
     const client = clientById(appt.clientId);
     const what = isNote(appt) ? "the note" : `${client?.name || "this"}'s booking`;
     askConfirm(`Delete ${what} on ${prettyDate(appt.date)}? This can't be undone.`, () =>
-      deleteAppointment(appt.id)
+      deleteAppointment(appt)
     );
   }
   function upsertClient(client) {
-    setClients((prev) => {
-      const exists = prev.some((c) => c.id === client.id);
-      return exists ? prev.map((c) => (c.id === client.id ? client : c)) : [...prev, client];
-    });
+    const prevClient = clients.find((c) => c.id === client.id) || null;
+    setClients((prev) =>
+      prev.some((c) => c.id === client.id) ? prev.map((c) => (c.id === client.id ? client : c)) : [...prev, client]
+    );
     setClientModal(null);
-    supabase.from("clients").upsert(client).then(({ error }) => {
-      if (error) reportSyncError("save that client", error);
-    });
+    runWrite("save that client", () => supabase.from("clients").upsert(client), () =>
+      setClients((prev) =>
+        prevClient ? prev.map((c) => (c.id === client.id ? prevClient : c)) : prev.filter((c) => c.id !== client.id)
+      )
+    );
   }
-  function deleteClient(id) {
-    setClients((prev) => prev.filter((c) => c.id !== id));
-    supabase.from("clients").delete().eq("id", id).then(({ error }) => {
-      if (error) reportSyncError("delete that client", error);
+  function deleteClient(client) {
+    // The database keeps their bookings but clears the client link; mirror that here.
+    const affected = appointments.filter((a) => a.clientId === client.id).map((a) => a.id);
+    setClients((prev) => prev.filter((c) => c.id !== client.id));
+    setAppointments((prev) => prev.map((a) => (a.clientId === client.id ? { ...a, clientId: null } : a)));
+    runWrite("delete that client", () => supabase.from("clients").delete().eq("id", client.id), () => {
+      setClients((prev) => (prev.some((c) => c.id === client.id) ? prev : [...prev, client]));
+      setAppointments((prev) => prev.map((a) => (affected.includes(a.id) ? { ...a, clientId: client.id } : a)));
     });
   }
   function confirmDeleteClient(client) {
     const count = appointments.filter((a) => a.clientId === client.id).length;
     const extra = count > 0 ? ` They have ${count} booking${count === 1 ? "" : "s"} on record, which will stay but show as "Unknown."` : "";
-    askConfirm(`Delete ${client.name}?${extra} This can't be undone.`, () => deleteClient(client.id));
+    askConfirm(`Delete ${client.name}?${extra} This can't be undone.`, () => deleteClient(client));
   }
   function upsertService(service) {
-    setServices((prev) => {
-      const exists = prev.some((s) => s.id === service.id);
-      return exists ? prev.map((s) => (s.id === service.id ? service : s)) : [...prev, service];
-    });
+    const prevService = services.find((x) => x.id === service.id) || null;
+    setServices((prev) =>
+      prev.some((x) => x.id === service.id) ? prev.map((x) => (x.id === service.id ? service : x)) : [...prev, service]
+    );
     setServiceModal(null);
-    supabase.from("services").upsert(service).then(({ error }) => {
-      if (error) reportSyncError("save that service", error);
-    });
+    runWrite("save that service", () => supabase.from("services").upsert(service), () =>
+      setServices((prev) =>
+        prevService ? prev.map((x) => (x.id === service.id ? prevService : x)) : prev.filter((x) => x.id !== service.id)
+      )
+    );
   }
-  function deleteService(id) {
-    setServices((prev) => prev.filter((s) => s.id !== id));
-    supabase.from("services").delete().eq("id", id).then(({ error }) => {
-      if (error) reportSyncError("delete that service", error);
-    });
+  function deleteService(service) {
+    setServices((prev) => prev.filter((x) => x.id !== service.id));
+    runWrite("delete that service", () => supabase.from("services").delete().eq("id", service.id), () =>
+      setServices((prev) => (prev.some((x) => x.id === service.id) ? prev : [...prev, service]))
+    );
   }
   function confirmDeleteService(service) {
-    askConfirm(`Delete "${service.name}" from your services list? This can't be undone.`, () => deleteService(service.id));
+    askConfirm(`Delete "${service.name}" from your services list? ${legacyMode ? "" : "Past bookings keep their price. "}This can't be undone.`, () => deleteService(service));
+  }
+
+  const backupAge = daysSince(lastBackup);
+  const showBackupReminder =
+    backupAge >= BACKUP_REMINDER_DAYS && (!snoozeUntil || isoDate(new Date()) > snoozeUntil);
+  function snoozeBackupReminder() {
+    const until = isoDate(addDays(new Date(), 7));
+    lsSet(SNOOZE_KEY, until);
+    setSnoozeUntil(until);
   }
 
   if (loading) {
@@ -356,6 +620,26 @@ export default function App() {
         <div style={{ background: "#3A2020", color: "#E88C8C" }} className="px-4 py-2 text-xs flex items-center justify-between gap-2">
           <span className="min-w-0">{syncError}</span>
           <button onClick={() => setSyncError(null)} className="shrink-0"><X size={13} /></button>
+        </div>
+      )}
+      {notice && (
+        <div style={{ background: "#1E3326", color: "#8FD1A4" }} className="px-4 py-2 text-xs flex items-center justify-between gap-2">
+          <span className="min-w-0">{notice}</span>
+          <button onClick={() => setNotice(null)} className="shrink-0"><X size={13} /></button>
+        </div>
+      )}
+      {legacyMode && (
+        <div style={{ background: "#3A2A20", color: "#E8B36E" }} className="px-4 py-2 text-xs">
+          One-time database update pending (supabase-migration-v2.sql). Until it's run, changing a service's price also changes old bookings.
+        </div>
+      )}
+      {showBackupReminder && (
+        <div style={{ background: "#3A2A20", color: "#E8B36E" }} className="px-4 py-2 text-xs flex items-center justify-between gap-3">
+          <span className="min-w-0">It's been {backupAge} days since your last backup.</span>
+          <span className="shrink-0 flex items-center gap-3 font-semibold">
+            <button onClick={exportBackup}>Back up now</button>
+            <button onClick={snoozeBackupReminder} style={{ opacity: 0.8 }}>Later</button>
+          </span>
         </div>
       )}
 
@@ -403,37 +687,24 @@ export default function App() {
             onDelete={confirmDeleteClient}
             onSelectClient={(c) => setClientDetailId(c.id)}
             onExport={exportBackup}
+            onRestoreFile={handleRestoreFile}
+            lastBackup={lastBackup}
           />
         )}
       </div>
 
-      {(tab === "bookings" || tab === "calendar") && (
-        <button
-          onClick={() => setApptModal({})}
-          style={{ background: ACCENT }}
-          className="fixed right-5 bottom-24 w-14 h-14 rounded-full flex items-center justify-center shadow-lg active:scale-95 transition-transform z-10"
-        >
-          <Plus size={26} color="#1A1215" strokeWidth={2.5} />
-        </button>
-      )}
-      {tab === "services" && (
-        <button
-          onClick={() => setServiceModal({})}
-          style={{ background: ACCENT }}
-          className="fixed right-5 bottom-24 w-14 h-14 rounded-full flex items-center justify-center shadow-lg active:scale-95 transition-transform z-10"
-        >
-          <Plus size={26} color="#1A1215" strokeWidth={2.5} />
-        </button>
-      )}
-      {tab === "clients" && (
-        <button
-          onClick={() => setClientModal({})}
-          style={{ background: ACCENT }}
-          className="fixed right-5 bottom-24 w-14 h-14 rounded-full flex items-center justify-center shadow-lg active:scale-95 transition-transform z-10"
-        >
-          <Plus size={26} color="#1A1215" strokeWidth={2.5} />
-        </button>
-      )}
+      <button
+        onClick={() => {
+          if (tab === "services") setServiceModal({});
+          else if (tab === "clients") setClientModal({});
+          else setApptModal({});
+        }}
+        aria-label="Add"
+        style={{ background: ACCENT, bottom: "calc(6rem + env(safe-area-inset-bottom))" }}
+        className="fixed right-5 w-14 h-14 rounded-full flex items-center justify-center shadow-lg active:scale-95 transition-transform z-10"
+      >
+        <Plus size={26} color="#1A1215" strokeWidth={2.5} />
+      </button>
 
       <BottomNav tab={tab} setTab={setTab} />
 
@@ -443,16 +714,9 @@ export default function App() {
           clients={clients}
           services={services}
           appointments={appointments}
+          apptDuration={apptDuration}
           onSave={upsertAppointment}
           onClose={() => setApptModal(null)}
-          onAddClient={(name, phone) => {
-            const c = { id: uid(), name, phone };
-            setClients((prev) => [...prev, c]);
-            supabase.from("clients").insert(c).then(({ error }) => {
-              if (error) reportSyncError("save that new client", error);
-            });
-            return c;
-          }}
         />
       )}
       {clientModal && (
@@ -515,6 +779,7 @@ export default function App() {
       {confirmState && (
         <ConfirmDialog
           message={confirmState.message}
+          confirmLabel={confirmState.confirmLabel}
           onCancel={() => setConfirmState(null)}
           onConfirm={() => {
             confirmState.onConfirm();
@@ -575,7 +840,7 @@ function BottomNav({ tab, setTab }) {
   ];
   return (
     <div
-      style={{ background: SURFACE, borderColor: BORDER }}
+      style={{ background: SURFACE, borderColor: BORDER, paddingBottom: "env(safe-area-inset-bottom)" }}
       className="fixed bottom-0 left-0 right-0 max-w-[430px] mx-auto border-t flex z-10"
     >
       {items.map(({ id, label, icon: Icon }) => {
@@ -635,6 +900,11 @@ function StatPill({ label, value }) {
 }
 
 function BookingsView({ appts, clientById, categoryOf, apptServiceNames, earnings, onEdit, onDelete }) {
+  // The list runs oldest to newest. Opening this tab scrolls to today's
+  // bookings, or the next upcoming one (or the newest, if nothing is ahead).
+  const todayIso = isoDate(new Date());
+  const nextIdx = appts.findIndex((a) => a.date >= todayIso);
+  const targetIdx = nextIdx === -1 ? appts.length - 1 : nextIdx;
   return (
     <div>
       {earnings && (
@@ -648,12 +918,22 @@ function BookingsView({ appts, clientById, categoryOf, apptServiceNames, earning
         <EmptyState text="No bookings yet. Tap + to add the first appointment." />
       ) : (
         <div className="flex flex-col gap-2">
-          {appts.map((a) => {
+          {appts.map((a, i) => {
             const client = clientById(a.clientId);
             const cat = categoryOf(a);
             const note = isNote(a);
+            const isTarget = i === targetIdx;
+            const showDivider = isTarget && nextIdx > 0;
             return (
-              <div key={a.id} style={{ background: SURFACE, borderColor: BORDER }} className="rounded-2xl border p-3">
+              <Fragment key={a.id}>
+                {showDivider && (
+                  <div id="next-booking" className="flex items-center gap-3 py-1">
+                    <div style={{ background: BORDER }} className="h-px flex-1" />
+                    <span style={{ color: ACCENT }} className="text-xs font-semibold">Today & upcoming</span>
+                    <div style={{ background: BORDER }} className="h-px flex-1" />
+                  </div>
+                )}
+              <div id={isTarget && !showDivider ? "next-booking" : undefined} style={{ background: SURFACE, borderColor: BORDER }} className="rounded-2xl border p-3">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
@@ -689,6 +969,7 @@ function BookingsView({ appts, clientById, categoryOf, apptServiceNames, earning
                   </div>
                 </div>
               </div>
+              </Fragment>
             );
           })}
         </div>
@@ -1102,7 +1383,8 @@ function DayBookingsSheet({ iso, appts, clientById, categoryOf, apptServiceNames
 }
 
 /* ---------- confirm dialog ---------- */
-function ConfirmDialog({ message, onCancel, onConfirm }) {
+function ConfirmDialog({ message, confirmLabel = "Delete", onCancel, onConfirm }) {
+  const danger = confirmLabel === "Delete";
   return (
     <div className="fixed inset-0 z-30 flex items-center justify-center px-6" style={{ background: "rgba(0,0,0,0.65)" }}>
       <div style={{ background: SURFACE, borderColor: BORDER }} className="w-full max-w-[340px] rounded-2xl border p-5">
@@ -1121,10 +1403,10 @@ function ConfirmDialog({ message, onCancel, onConfirm }) {
           </button>
           <button
             onClick={onConfirm}
-            style={{ background: "#3A2020", color: "#E88C8C" }}
+            style={danger ? { background: "#3A2020", color: "#E88C8C" } : { background: ACCENT, color: "#1A1215" }}
             className="flex-1 rounded-xl py-2.5 text-sm font-semibold"
           >
-            Delete
+            {confirmLabel}
           </button>
         </div>
       </div>
@@ -1249,7 +1531,8 @@ function ServicesView({ services, serviceStats, onAdd, onEdit, onDelete }) {
 }
 
 /* ---------- clients ---------- */
-function ClientsView({ clients, appointments, onAdd, onEdit, onDelete, onSelectClient, onExport }) {
+function ClientsView({ clients, appointments, onAdd, onEdit, onDelete, onSelectClient, onExport, onRestoreFile, lastBackup }) {
+  const fileRef = useRef(null);
   const countFor = (id) => appointments.filter((a) => a.clientId === id).length;
   return (
     <div>
@@ -1272,13 +1555,36 @@ function ClientsView({ clients, appointments, onAdd, onEdit, onDelete, onSelectC
           ))}
         </div>
       )}
-      <button
-        onClick={onExport}
-        style={{ background: SURFACE, borderColor: BORDER, color: TEXT_DIM }}
-        className="w-full mt-4 rounded-xl border py-2.5 text-xs font-medium flex items-center justify-center gap-1.5"
-      >
-        <Download size={13} /> Export backup (clients, services, bookings)
-      </button>
+      <div className="flex gap-2 mt-4">
+        <button
+          onClick={onExport}
+          style={{ background: SURFACE, borderColor: BORDER, color: TEXT_DIM }}
+          className="flex-1 rounded-xl border py-2.5 text-xs font-medium flex items-center justify-center gap-1.5"
+        >
+          <Download size={13} /> Export backup
+        </button>
+        <button
+          onClick={() => fileRef.current && fileRef.current.click()}
+          style={{ background: SURFACE, borderColor: BORDER, color: TEXT_DIM }}
+          className="flex-1 rounded-xl border py-2.5 text-xs font-medium flex items-center justify-center gap-1.5"
+        >
+          <Upload size={13} /> Restore backup
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".json,application/json"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files && e.target.files[0];
+            e.target.value = "";
+            if (file) onRestoreFile(file);
+          }}
+        />
+      </div>
+      <div style={{ color: TEXT_DIM }} className="text-[11px] text-center mt-2">
+        Last backup: {lastBackup ? prettyDate(lastBackup) : "never"}
+      </div>
     </div>
   );
 }
@@ -1306,7 +1612,7 @@ function ModalShell({ title, onClose, children, onSubmit, submitLabel = "Save" }
           </button>
         </div>
         {children}
-        <div className="flex gap-3 mt-5">
+        <div className="flex gap-3 mt-5" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
           <button
             onClick={onClose}
             style={{ background: SURFACE_2, color: TEXT, borderColor: BORDER }}
@@ -1341,7 +1647,7 @@ const inputStyle = { background: SURFACE_2, color: TEXT, borderColor: BORDER };
 const inputCls = "w-full text-sm rounded-xl border px-3 py-2.5 outline-none";
 
 /* ---------- appointment modal ---------- */
-function AppointmentModal({ appt, clients, services, appointments, onSave, onClose, onAddClient }) {
+function AppointmentModal({ appt, clients, services, appointments, apptDuration, onSave, onClose }) {
   const isNew = !appt.id;
   // "booking" = normal client appointment, "note" = a plain calendar note.
   // Editing an existing entry keeps its type; the switch only shows for new ones.
@@ -1361,8 +1667,26 @@ function AppointmentModal({ appt, clients, services, appointments, onSave, onClo
     setServiceIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   }
 
-  const totalCost = serviceIds.reduce((sum, id) => sum + (services.find((s) => s.id === id)?.price || 0), 0);
-  const totalDuration = serviceIds.reduce((sum, id) => sum + (services.find((s) => s.id === id)?.duration || 0), 0);
+  // Services this booking is made of. Ones it already had keep the price and
+  // duration they were booked at; newly ticked ones use today's price.
+  const existingItems = useMemo(
+    () =>
+      appt.items && appt.items.length
+        ? appt.items
+        : (appt.serviceIds || []).map((id) => services.find((s) => s.id === id)).filter(Boolean).map(snapshotItem),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [appt]
+  );
+  const items = serviceIds
+    .map((id) => {
+      const kept = existingItems.find((i) => i.id === id);
+      if (kept) return kept;
+      const live = services.find((s) => s.id === id);
+      return live ? snapshotItem(live) : null;
+    })
+    .filter(Boolean);
+  const totalCost = items.reduce((sum, i) => sum + i.price, 0);
+  const totalDuration = items.reduce((sum, i) => sum + i.duration, 0);
 
   const conflict = useMemo(() => {
     if (noteMode || !date || !time || totalDuration === 0) return null;
@@ -1373,9 +1697,9 @@ function AppointmentModal({ appt, clients, services, appointments, onSave, onClo
       if (isNote(a)) return false; // notes never count as a scheduling conflict
       if (a.date !== date) return false;
       const aStart = timeToMin(a.time);
-      const aDur = (a.serviceIds || []).reduce((sum, id) => sum + (services.find((s) => s.id === id)?.duration || 0), 0);
-      return rangesOverlap(start, end, aStart, aStart + aDur);
+      return rangesOverlap(start, end, aStart, aStart + apptDuration(a));
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [noteMode, date, time, totalDuration, appointments, appt.id, services]);
 
   function isDuplicateName(name) {
@@ -1386,23 +1710,28 @@ function AppointmentModal({ appt, clients, services, appointments, onSave, onClo
   function handleSave() {
     if (noteMode) {
       if (!date || !time) return;
-      onSave({ id: appt.id || uid(), clientId: null, serviceIds: [], date, time, notes: notes.trim() });
+      onSave({ id: appt.id || uid(), clientId: null, serviceIds: [], items: [], date, time, notes: notes.trim() });
       return;
     }
+    // Check everything first, so nothing is created unless the booking can be saved.
     let finalClientId = clientId;
+    let newClient = null;
     if (addingClient) {
       const trimmed = newClientName.trim();
-      if (!trimmed) return;
+      if (!trimmed) { setClientError("Enter the client's name."); return; }
       const dup = isDuplicateName(trimmed);
       if (dup) {
         setClientError(`"${dup.name}" is already a client — select them from the list instead.`);
         return;
       }
-      const c = onAddClient(trimmed, newClientPhone.trim());
-      finalClientId = c.id;
+      newClient = { id: uid(), name: trimmed, phone: newClientPhone.trim() };
+      finalClientId = newClient.id;
     }
     if (!finalClientId || serviceIds.length === 0 || !date || !time) return;
-    onSave({ id: appt.id || uid(), clientId: finalClientId, serviceIds, date, time, notes });
+    onSave(
+      { id: appt.id || uid(), clientId: finalClientId, serviceIds, items, date, time, notes },
+      newClient
+    );
   }
 
   return (

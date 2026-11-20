@@ -1,5 +1,39 @@
 # Kay Kay Nails — setup guide
 
+## Updating to version 2 (already live? start here)
+
+Do these in order. The first step must come first.
+
+1. **Update the database (once).** In Supabase open **SQL Editor > New query**,
+   paste everything from `supabase-migration-v2.sql`, click **Run**. It says
+   "Success". Safe to run twice.
+2. **Copy the new files.** Unzip the update over your `kaykay-app` folder
+   and choose "Replace" if asked. Your `.env` and `.git` are not touched.
+3. **Push it live:**
+   ```
+   git add -A
+   git commit -m "Version 2"
+   git push
+   ```
+   Vercel updates the site in about a minute.
+4. **Keep the database awake (optional, recommended).** In GitHub open your
+   repo > **Settings > Secrets and variables > Actions > New repository secret**
+   and add two secrets: `SUPABASE_URL` (your Project URL) and
+   `SUPABASE_ANON_KEY` (the anon public key). Then open the **Actions** tab,
+   pick "Keep database awake" and click **Run workflow** once to test it.
+   It then pings the database every 3 days so Supabase's free plan never pauses it.
+5. **Get the new icon.** On her phone, delete the old home-screen shortcut,
+   open the site again and use "Add to Home Screen" (Share button on iPhone,
+   menu on Android). It now opens full screen with the new icon.
+
+What's new: week total fixed, new client + booking saved safely, no
+1,000-booking limit, failed saves are undone with a message, prices are
+remembered per booking, Restore backup button and 14-day backup reminder,
+auto-refresh when reopening, app icon and full-screen mode, opens on the
+Calendar, and Bookings jumps to today / the next booking.
+
+---
+
 This is the hosted version of the app: a real database (Supabase) instead
 of Claude's storage, hosted for free on Vercel, with auto-deploy from
 GitHub so future updates are just `git push`.
@@ -98,8 +132,9 @@ git push
   view and edit the data. That's fine for a private link only she uses,
   but if you ever want to lock it down further, that's a separate
   feature (Supabase Auth) we can add later.
-- **Backups:** the in-app "Export backup" button in the Clients tab still
-  works and downloads a JSON snapshot any time.
+- **Backups:** the Clients tab has **Export backup** and **Restore backup**.
+  Only restore a file exported from this live app. The app reminds you
+  every 14 days.
 - **Home screen shortcut:** once deployed, open the Vercel link on her
   phone's browser and use "Add to Home Screen" the same way we discussed
   for the Claude-hosted version.

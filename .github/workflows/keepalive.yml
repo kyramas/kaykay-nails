@@ -1,0 +1,22 @@
+# Pings the database every few days so Supabase's free plan never pauses it
+# for being idle. Needs two secrets: SUPABASE_URL and SUPABASE_ANON_KEY
+# (GitHub repo > Settings > Secrets and variables > Actions).
+name: Keep database awake
+
+on:
+  schedule:
+    - cron: "0 9 */3 * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          curl -fsS "$SUPABASE_URL/rest/v1/services?select=id&limit=1" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY"
