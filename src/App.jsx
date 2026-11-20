@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef, Fragment } from "rea
 import {
   Plus, X, Trash2, Pencil, Phone, MessageCircle, ChevronRight,
   ChevronLeft, Search, ListChecks, CalendarDays, Sparkles, Users,
-  RefreshCw, Check, Download, Upload, AlertTriangle,
+  RefreshCw, Check, Download, Upload, AlertTriangle, BarChart3,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
@@ -214,6 +214,111 @@ function downloadJSON(filename, data) {
   URL.revokeObjectURL(url);
 }
 
+/* ---------- stats ---------- */
+// Everything on the Stats tab. Notes are ignored. Today / week / month and the
+// per-week / per-month charts count every booked appointment in that period
+// (including ones still to come). Averages and the top-5 lists only use
+// bookings up to today, so future bookings don't inflate them.
+function computeStats({ appointments, apptTotal, itemsFor, clientById, serviceById }) {
+  const now = new Date();
+  const todayIso = isoDate(now);
+  const weekStartDate = startOfWeek(now);
+  const weekStart = isoDate(weekStartDate);
+  const weekEnd = isoDate(addDays(weekStartDate, 6));
+  const monthPrefix = `${now.getFullYear()}-${pad(now.getMonth() + 1)}`;
+
+  const weeks = Array.from({ length: 8 }, (_, i) => {
+    const start = addDays(weekStartDate, -7 * (7 - i));
+    return {
+      start: isoDate(start),
+      end: isoDate(addDays(start, 6)),
+      label: start.toLocaleDateString(undefined, { day: "numeric", month: "short" }),
+      count: 0,
+      revenue: 0,
+      current: i === 7,
+    };
+  });
+  const months = Array.from({ length: 6 }, (_, i) => {
+    const d = new Date(now.getFullYear(), now.getMonth() - (5 - i), 1);
+    return {
+      key: `${d.getFullYear()}-${pad(d.getMonth() + 1)}`,
+      label: d.toLocaleDateString(undefined, { month: "short" }),
+      count: 0,
+      revenue: 0,
+      current: i === 5,
+    };
+  });
+
+  const period = {
+    today: { total: 0, count: 0 },
+    week: { total: 0, count: 0 },
+    month: { total: 0, count: 0 },
+  };
+  const clientAgg = {};
+  const serviceAgg = {};
+  let pastTotal = 0, pastCount = 0, firstDate = null;
+
+  appointments.forEach((a) => {
+    if (isNote(a)) return;
+    const total = apptTotal(a);
+    if (a.date === todayIso) { period.today.total += total; period.today.count += 1; }
+    if (a.date >= weekStart && a.date <= weekEnd) { period.week.total += total; period.week.count += 1; }
+    if (a.date.startsWith(monthPrefix)) { period.month.total += total; period.month.count += 1; }
+
+    const w = weeks.find((x) => a.date >= x.start && a.date <= x.end);
+    if (w) { w.count += 1; w.revenue += total; }
+    const m = months.find((x) => a.date.startsWith(x.key));
+    if (m) { m.count += 1; m.revenue += total; }
+
+    if (a.date > todayIso) return; // the rest only looks at the past and today
+    pastTotal += total;
+    pastCount += 1;
+    if (!firstDate || a.date < firstDate) firstDate = a.date;
+    if (a.clientId) {
+      if (!clientAgg[a.clientId]) clientAgg[a.clientId] = { client: clientById(a.clientId), visits: 0, total: 0 };
+      clientAgg[a.clientId].visits += 1;
+      clientAgg[a.clientId].total += total;
+    }
+    itemsFor(a).forEach((item) => {
+      if (!serviceAgg[item.id]) {
+        const live = serviceById(item.id);
+        serviceAgg[item.id] = { name: live?.name || item.name, category: live?.category || item.category, count: 0, revenue: 0 };
+      }
+      serviceAgg[item.id].count += 1;
+      serviceAgg[item.id].revenue += Number(item.price) || 0;
+    });
+  });
+
+  let weeksSpan = 1, monthsSpan = 1;
+  if (firstDate) {
+    const [fy, fm, fd] = firstDate.split("-").map(Number);
+    const firstWeek = startOfWeek(new Date(fy, fm - 1, fd));
+    weeksSpan = Math.max(1, Math.round((weekStartDate - firstWeek) / (7 * 86400000)) + 1);
+    monthsSpan = Math.max(1, (now.getFullYear() - fy) * 12 + (now.getMonth() + 1 - fm) + 1);
+  }
+
+  return {
+    period,
+    weeks,
+    months,
+    averages: {
+      perBooking: pastCount ? pastTotal / pastCount : 0,
+      perWeek: pastTotal / weeksSpan,
+      perMonth: pastTotal / monthsSpan,
+      since: firstDate,
+      bookings: pastCount,
+    },
+    topClients: Object.values(clientAgg)
+      .filter((c) => c.client)
+      .sort((x, y) => y.total - x.total || y.visits - x.visits)
+      .slice(0, 5),
+    topServices: Object.values(serviceAgg)
+      .sort((x, y) => y.count - x.count || y.revenue - x.revenue)
+      .slice(0, 5),
+    hasBookings: appointments.some((a) => !isNote(a)),
+  };
+}
+
 /* ============================================================ */
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -400,35 +505,11 @@ export default function App() {
     });
   }, [sortedAppointments, search, clientById, services]);
 
-  const earnings = useMemo(() => {
-    const now = new Date();
-    const todayIso = isoDate(now);
-    const weekStart = isoDate(startOfWeek(now));
-    const weekEnd = isoDate(addDays(startOfWeek(now), 6));
-    const monthPrefix = `${now.getFullYear()}-${pad(now.getMonth() + 1)}`;
-    let today = 0, week = 0, month = 0;
-    appointments.forEach((a) => {
-      const total = apptTotal(a);
-      if (a.date === todayIso) today += total;
-      if (a.date >= weekStart && a.date <= weekEnd) week += total;
-      if (a.date.startsWith(monthPrefix)) month += total;
-    });
-    return { today, week, month };
-  }, [appointments, services]);
-
-  const serviceStats = useMemo(() => {
-    const stats = {};
-    appointments.forEach((a) => {
-      if (isNote(a)) return;
-      itemsFor(a).forEach((item) => {
-        const key = item.id;
-        if (!stats[key]) stats[key] = { service: serviceById(key) || item, count: 0, revenue: 0 };
-        stats[key].count += 1;
-        stats[key].revenue += Number(item.price) || 0;
-      });
-    });
-    return Object.values(stats).sort((a, b) => b.count - a.count);
-  }, [appointments, services]);
+  const stats = useMemo(
+    () => computeStats({ appointments, apptTotal, itemsFor, clientById, serviceById }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [appointments, services, clients]
+  );
 
   function exportBackup() {
     downloadJSON(`kaykay-nails-backup-${isoDate(new Date())}.json`, { clients, services, appointments });
@@ -650,7 +731,6 @@ export default function App() {
             clientById={clientById}
             categoryOf={categoryOf}
             apptServiceNames={apptServiceNames}
-            earnings={earnings}
             onEdit={(a) => setApptModal(a)}
             onDelete={confirmDeleteAppointment}
           />
@@ -669,10 +749,10 @@ export default function App() {
             onDaySelect={(iso) => setDayListDate(iso)}
           />
         )}
+        {tab === "stats" && <StatsView stats={stats} />}
         {tab === "services" && (
           <ServicesView
             services={services}
-            serviceStats={serviceStats}
             onAdd={() => setServiceModal({})}
             onEdit={(s) => setServiceModal(s)}
             onDelete={confirmDeleteService}
@@ -693,6 +773,7 @@ export default function App() {
         )}
       </div>
 
+      {tab !== "stats" && (
       <button
         onClick={() => {
           if (tab === "services") setServiceModal({});
@@ -705,6 +786,7 @@ export default function App() {
       >
         <Plus size={26} color="#1A1215" strokeWidth={2.5} />
       </button>
+      )}
 
       <BottomNav tab={tab} setTab={setTab} />
 
@@ -793,7 +875,7 @@ export default function App() {
 
 /* ---------- header ---------- */
 function Header({ tab, search, setSearch }) {
-  const titles = { bookings: "All Bookings", calendar: "Calendar", services: "Services", clients: "Clients" };
+  const titles = { bookings: "All Bookings", calendar: "Calendar", stats: "Stats", services: "Services", clients: "Clients" };
   const [showSearch, setShowSearch] = useState(false);
   return (
     <div style={{ background: SURFACE, borderColor: BORDER }} className="border-b px-4 pt-5 pb-3">
@@ -835,6 +917,7 @@ function BottomNav({ tab, setTab }) {
   const items = [
     { id: "bookings", label: "Bookings", icon: ListChecks },
     { id: "calendar", label: "Calendar", icon: CalendarDays },
+    { id: "stats", label: "Stats", icon: BarChart3 },
     { id: "services", label: "Services", icon: Sparkles },
     { id: "clients", label: "Clients", icon: Users },
   ];
@@ -899,7 +982,139 @@ function StatPill({ label, value }) {
   );
 }
 
-function BookingsView({ appts, clientById, categoryOf, apptServiceNames, earnings, onEdit, onDelete }) {
+function StatSection({ title, note, children }) {
+  return (
+    <div>
+      <div className="mb-2">
+        <div style={{ color: TEXT_DIM }} className="text-xs font-semibold">{title}</div>
+        {note && <div style={{ color: TEXT_DIM, opacity: 0.8 }} className="text-[11px] mt-0.5">{note}</div>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function StatCard({ label, value, sub }) {
+  return (
+    <div style={{ background: SURFACE, borderColor: BORDER }} className="flex-1 rounded-xl border px-2.5 py-3 text-center min-w-0">
+      <div style={{ color: TEXT_DIM }} className="text-[11px]">{label}</div>
+      <div style={{ color: ACCENT }} className="text-base font-semibold mt-1 truncate">{value}</div>
+      {sub && <div style={{ color: TEXT_DIM }} className="text-[11px] mt-0.5">{sub}</div>}
+    </div>
+  );
+}
+
+function CountBars({ rows }) {
+  const max = Math.max(1, ...rows.map((r) => r.count));
+  return (
+    <div style={{ background: SURFACE, borderColor: BORDER }} className="rounded-2xl border p-3 flex flex-col gap-2">
+      {rows.map((r) => (
+        <div key={r.label + (r.start || r.key)} className="flex items-center gap-2.5">
+          <span style={{ color: r.current ? TEXT : TEXT_DIM }} className="text-xs w-12 shrink-0">{r.label}</span>
+          <div style={{ background: SURFACE_2 }} className="flex-1 h-3.5 rounded-full overflow-hidden">
+            <div
+              style={{ width: `${(r.count / max) * 100}%`, background: r.current ? ACCENT : "#7A5461" }}
+              className="h-full rounded-full"
+            />
+          </div>
+          <span className="text-xs w-[92px] shrink-0 text-right">
+            <span className="font-semibold">{r.count}</span>
+            <span style={{ color: TEXT_DIM }}> · {money(r.revenue)}</span>
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StatsView({ stats }) {
+  if (!stats.hasBookings) {
+    return <EmptyState text="No stats yet. Add some bookings and they'll show up here." />;
+  }
+  const { period, averages, weeks, months, topClients, topServices } = stats;
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const sinceText = averages.since
+    ? (() => {
+        const [y, m] = averages.since.split("-").map(Number);
+        return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "short", year: "numeric" });
+      })()
+    : "";
+  return (
+    <div className="flex flex-col gap-6">
+      <StatSection title="Earnings" note="Counts every booked appointment, including ones still to come.">
+        <div className="flex gap-2">
+          <StatCard label="Today" value={money(period.today.total)} sub={plural(period.today.count, "booking")} />
+          <StatCard label="This week" value={money(period.week.total)} sub={plural(period.week.count, "booking")} />
+          <StatCard label="This month" value={money(period.month.total)} sub={plural(period.month.count, "booking")} />
+        </div>
+      </StatSection>
+
+      <StatSection
+        title="Averages"
+        note={averages.bookings ? `From ${plural(averages.bookings, "booking")} up to today, since ${sinceText}.` : "No bookings up to today yet."}
+      >
+        <div className="flex gap-2">
+          <StatCard label="Per booking" value={money(averages.perBooking)} />
+          <StatCard label="Per week" value={money(averages.perWeek)} />
+          <StatCard label="Per month" value={money(averages.perMonth)} />
+        </div>
+      </StatSection>
+
+      <StatSection title="Appointments per week" note="Last 8 weeks. Bookings · earnings.">
+        <CountBars rows={weeks} />
+      </StatSection>
+
+      <StatSection title="Appointments per month" note="Last 6 months. Bookings · earnings.">
+        <CountBars rows={months} />
+      </StatSection>
+
+      <StatSection title="Top 5 clients" note="By total spent, up to today.">
+        {topClients.length === 0 ? (
+          <EmptyState compact text="No client bookings yet." />
+        ) : (
+          <div style={{ background: SURFACE, borderColor: BORDER }} className="rounded-2xl border divide-y">
+            {topClients.map(({ client, visits, total }, i) => (
+              <div key={client.id} style={{ borderColor: BORDER }} className="flex items-center justify-between gap-3 px-3 py-2.5">
+                <div className="flex items-center gap-3 min-w-0">
+                  <span style={{ color: TEXT_DIM }} className="text-xs w-3 shrink-0">{i + 1}</span>
+                  <span className="text-sm font-medium truncate">{client.name}</span>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <span style={{ color: TEXT_DIM }} className="text-xs">{plural(visits, "visit")}</span>
+                  <span style={{ color: ACCENT }} className="text-sm font-semibold">{money(total)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </StatSection>
+
+      <StatSection title="Top 5 services" note="By number of bookings, up to today.">
+        {topServices.length === 0 ? (
+          <EmptyState compact text="No services booked yet." />
+        ) : (
+          <div style={{ background: SURFACE, borderColor: BORDER }} className="rounded-2xl border divide-y">
+            {topServices.map((sv, i) => (
+              <div key={sv.name} style={{ borderColor: BORDER }} className="flex items-center justify-between gap-3 px-3 py-2.5">
+                <div className="flex items-center gap-3 min-w-0">
+                  <span style={{ color: TEXT_DIM }} className="text-xs w-3 shrink-0">{i + 1}</span>
+                  <CategoryDot category={sv.category} />
+                  <span className="text-sm font-medium truncate">{sv.name}</span>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <span style={{ color: TEXT_DIM }} className="text-xs">{plural(sv.count, "booking")}</span>
+                  <span style={{ color: ACCENT }} className="text-sm font-semibold">{money(sv.revenue)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </StatSection>
+    </div>
+  );
+}
+
+function BookingsView({ appts, clientById, categoryOf, apptServiceNames, onEdit, onDelete }) {
   // The list runs oldest to newest. Opening this tab scrolls to today's
   // bookings, or the next upcoming one (or the newest, if nothing is ahead).
   const todayIso = isoDate(new Date());
@@ -907,13 +1122,6 @@ function BookingsView({ appts, clientById, categoryOf, apptServiceNames, earning
   const targetIdx = nextIdx === -1 ? appts.length - 1 : nextIdx;
   return (
     <div>
-      {earnings && (
-        <div className="flex gap-2 mb-4">
-          <StatPill label="Today" value={money(earnings.today)} />
-          <StatPill label="This week" value={money(earnings.week)} />
-          <StatPill label="This month" value={money(earnings.month)} />
-        </div>
-      )}
       {appts.length === 0 ? (
         <EmptyState text="No bookings yet. Tap + to add the first appointment." />
       ) : (
@@ -1472,35 +1680,14 @@ function ClientDetailModal({ client, appointments, categoryOf, apptServiceNames,
 }
 
 /* ---------- services ---------- */
-function ServicesView({ services, serviceStats, onAdd, onEdit, onDelete }) {
+function ServicesView({ services, onAdd, onEdit, onDelete }) {
   const grouped = CATEGORY_ORDER.map((cat) => ({
     cat,
     items: services.filter((s) => s.category === cat),
   })).filter((g) => g.items.length);
 
-  const topServices = (serviceStats || []).slice(0, 5);
-
   return (
     <div className="flex flex-col gap-5">
-      {topServices.length > 0 && (
-        <div>
-          <div style={{ color: TEXT_DIM }} className="text-xs font-semibold tracking-wide mb-2">MOST BOOKED</div>
-          <div style={{ background: SURFACE, borderColor: BORDER }} className="rounded-2xl border divide-y">
-            {topServices.map(({ service, count, revenue }) => (
-              <div key={service.id} style={{ borderColor: BORDER }} className="flex items-center justify-between px-3 py-2.5">
-                <div className="flex items-center gap-2 min-w-0">
-                  <CategoryDot category={service.category} />
-                  <span className="text-sm font-medium truncate">{service.name}</span>
-                </div>
-                <div className="flex items-center gap-3 shrink-0">
-                  <span style={{ color: TEXT_DIM }} className="text-xs">{count} booking{count === 1 ? "" : "s"}</span>
-                  <span style={{ color: ACCENT }} className="text-sm font-semibold">{money(revenue)}</span>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
       {grouped.map(({ cat, items }) => (
         <div key={cat}>
           <div className="flex items-center gap-2 mb-2">

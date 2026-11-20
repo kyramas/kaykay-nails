@@ -1,5 +1,22 @@
 # Kay Kay Nails — setup guide
 
+## Update 3: Stats tab (no database change)
+
+1. Unzip over your `kaykay-app` folder and choose Replace.
+2. In Command Prompt, inside the folder:
+   ```
+   git add -A
+   git commit -m "Add Stats tab"
+   git push
+   ```
+3. Wait about a minute, then reload the site.
+
+New: a **Stats** tab with today / week / month earnings, averages, bookings per
+week and per month, top 5 clients and top 5 services. The earnings boxes moved
+off the Bookings page, and "Most booked" moved from Services to Stats.
+
+---
+
 ## Updating to version 2 (already live? start here)
 
 Do these in order. The first step must come first.
